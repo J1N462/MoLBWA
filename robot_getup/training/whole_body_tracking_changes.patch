@@ -1,0 +1,488 @@
+diff --git a/scripts/rsl_rl/play.py b/scripts/rsl_rl/play.py
+index 6d35bfd..b135cb0 100644
+--- a/scripts/rsl_rl/play.py
++++ b/scripts/rsl_rl/play.py
+@@ -20,6 +20,7 @@ parser.add_argument(
+ parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+ parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
++parser.add_argument("--from_start", action="store_true", help="Play the motion from frame 0 without randomization.")
+ # append RSL-RL cli arguments
+ cli_args.add_rsl_rl_args(parser)
+ # append AppLauncher cli args
+@@ -39,6 +40,7 @@ simulation_app = app_launcher.app
+ """Rest everything follows."""
+ 
+ import gymnasium as gym
++import importlib.metadata as metadata
+ import os
+ import pathlib
+ import torch
+@@ -53,7 +55,12 @@ from isaaclab.envs import (
+     multi_agent_to_single_agent,
+ )
+ from isaaclab.utils.dict import print_dict
+-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
++from isaaclab_rl.rsl_rl import (
++    RslRlOnPolicyRunnerCfg,
++    RslRlVecEnvWrapper,
++    handle_deprecated_rsl_rl_cfg,
++    handle_deprecated_rsl_rl_checkpoint,
++)
+ from isaaclab_tasks.utils import get_checkpoint_path
+ from isaaclab_tasks.utils.hydra import hydra_task_config
+ 
+@@ -62,11 +69,22 @@ import whole_body_tracking.tasks  # noqa: F401
+ from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+ 
+ 
++RSL_RL_VERSION = metadata.version("rsl-rl-lib")
++
++
+ @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+     """Play with RSL-RL agent."""
+     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
++    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, RSL_RL_VERSION)
+     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
++    if args_cli.from_start:
++        env_cfg.episode_length_s = 30.0
++        env_cfg.commands.motion.pose_range = {}
++        env_cfg.commands.motion.velocity_range = {}
++        env_cfg.commands.motion.joint_position_range = (0.0, 0.0)
++        if hasattr(env_cfg.events, "push_robot"):
++            env_cfg.events.push_robot = None
+ 
+     # specify directory for logging experiments
+     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+@@ -132,10 +150,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+         env = multi_agent_to_single_agent(env)
+ 
+     # wrap around environment for rsl-rl
+-    env = RslRlVecEnvWrapper(env)
++    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
++    if args_cli.from_start:
++        motion_cmd = env.unwrapped.command_manager.get_term("motion")
++
++        def _start_from_zero(env_ids):
++            motion_cmd.time_steps[env_ids] = 0
++
++        motion_cmd._adaptive_sampling = _start_from_zero
++        env.reset()
+ 
+     # load previously trained model
+     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
++    resume_path = handle_deprecated_rsl_rl_checkpoint(resume_path, RSL_RL_VERSION)
+     ppo_runner.load(resume_path)
+ 
+     # obtain the trained policy for inference
+@@ -146,14 +173,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+ 
+     export_motion_policy_as_onnx(
+         env.unwrapped,
+-        ppo_runner.alg.policy,
+-        normalizer=ppo_runner.obs_normalizer,
++        ppo_runner.alg.get_policy(),
+         path=export_model_dir,
+         filename="policy.onnx",
+     )
+     attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
+     # reset environment
+-    obs, _ = env.get_observations()
++    obs = env.get_observations()
++    if isinstance(obs, tuple):  # older rsl_rl wrappers returned (obs, extras)
++        obs = obs[0]
+     timestep = 0
+     # simulate environment
+     while simulation_app.is_running():
+@@ -162,7 +190,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+             # agent stepping
+             actions = policy(obs)
+             # env stepping
+-            obs, _, _, _ = env.step(actions)
++            obs, _, dones, _ = env.step(actions)
++            if args_cli.from_start:
++                _ep = globals().setdefault("_ep_steps", torch.zeros(len(dones), dtype=torch.long, device=dones.device))
++                _ep += 1
++                _done_ids = torch.nonzero(dones).flatten().tolist()
++                if _done_ids:
++                    _tm = env.unwrapped.termination_manager
++                    for _i in _done_ids:
++                        _hits = [n for n in _tm.active_terms if bool(_tm.get_term(n)[_i])]
++                        print(f"[from_start] env {_i:3d} 종료 t={int(_ep[_i]) * env.unwrapped.step_dt:5.2f}s 원인={_hits}")
++                    _ep[_done_ids] = 0
++            if hasattr(policy, "reset"):
++                policy.reset(dones)
+         if args_cli.video:
+             timestep += 1
+             # Exit the play loop after recording one video
+diff --git a/scripts/rsl_rl/train.py b/scripts/rsl_rl/train.py
+index c9fd5f8..5156ac1 100644
+--- a/scripts/rsl_rl/train.py
++++ b/scripts/rsl_rl/train.py
+@@ -46,6 +46,7 @@ simulation_app = app_launcher.app
+ """Rest everything follows."""
+ 
+ import gymnasium as gym
++import importlib.metadata as metadata
+ import os
+ import torch
+ from datetime import datetime
+@@ -58,8 +59,8 @@ from isaaclab.envs import (
+     multi_agent_to_single_agent,
+ )
+ from isaaclab.utils.dict import print_dict
+-from isaaclab.utils.io import dump_pickle, dump_yaml
+-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
++from isaaclab.utils.io import dump_yaml
++from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
+ from isaaclab_tasks.utils import get_checkpoint_path
+ from isaaclab_tasks.utils.hydra import hydra_task_config
+ 
+@@ -67,17 +68,34 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
+ import whole_body_tracking.tasks  # noqa: F401
+ from whole_body_tracking.utils.my_on_policy_runner import MotionOnPolicyRunner as OnPolicyRunner
+ 
++RSL_RL_VERSION = metadata.version("rsl-rl-lib")
++
+ torch.backends.cuda.matmul.allow_tf32 = True
+ torch.backends.cudnn.allow_tf32 = True
+ torch.backends.cudnn.deterministic = False
+ torch.backends.cudnn.benchmark = False
+ 
++# rsl-rl passes wandb.Settings(start_method=...), which new wandb rejects -> drop that key.
++import wandb as _wandb
++
++_WandbSettings = _wandb.Settings
++
++
++def _wandb_settings_compat(*args, **kwargs):
++    kwargs.pop("start_method", None)
++    return _WandbSettings(*args, **kwargs)
++
++
++_wandb.Settings = _wandb_settings_compat
++
+ 
+ @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+     """Train with RSL-RL agent."""
+     # override configurations with non-hydra CLI arguments
+     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
++    # convert legacy rsl_rl config (policy / empirical_normalization) for the installed rsl-rl-lib
++    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, RSL_RL_VERSION)
+     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+     agent_cfg.max_iterations = (
+         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
+@@ -129,7 +147,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+         env = multi_agent_to_single_agent(env)
+ 
+     # wrap around environment for rsl-rl
+-    env = RslRlVecEnvWrapper(env)
++    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+ 
+     # create runner from rsl-rl
+     runner = OnPolicyRunner(
+@@ -148,8 +166,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+     # dump the configuration into log-directory
+     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+-    dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
+-    dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
+ 
+     # run training
+     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/__init__.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/__init__.py
+index f979d0c..fa79e22 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/__init__.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/__init__.py
+@@ -1,6 +1,6 @@
+ import gymnasium as gym
+ 
+-from . import agents, flat_env_cfg
++from . import agents, flat_env_cfg, getup_env_cfg
+ 
+ ##
+ # Register Gym environments.
+@@ -36,3 +36,36 @@ gym.register(
+         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatLowFreqPPORunnerCfg",
+     },
+ )
++
++
++gym.register(
++    id="Tracking-Getup-G1-v0",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": getup_env_cfg.G1GetupEnvCfg,
++        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg",
++    },
++)
++
++
++gym.register(
++    id="Tracking-Getup-Robust-G1-v0",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": getup_env_cfg.G1GetupRobustEnvCfg,
++        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg",
++    },
++)
++
++
++gym.register(
++    id="Tracking-Getup-Robust-FakeHand-G1-v0",
++    entry_point="isaaclab.envs:ManagerBasedRLEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": getup_env_cfg.G1GetupRobustFakeHandEnvCfg,
++        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg",
++    },
++)
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/getup_env_cfg.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/getup_env_cfg.py
+new file mode 100644
+index 0000000..43168d2
+--- /dev/null
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/getup_env_cfg.py
+@@ -0,0 +1,103 @@
++"""기상 전용 task: 실패 감지를 강화한 Wo-State-Estimation 변형 (add_getup_task.py가 생성)."""
++import os
++
++import torch
++
++import isaaclab.utils.math as math_utils
++from isaaclab.managers import SceneEntityCfg
++from isaaclab.managers import EventTermCfg as EventTerm
++from isaaclab.managers import TerminationTermCfg as DoneTerm
++from isaaclab.utils import configclass
++import isaaclab.envs.mdp as isaac_mdp
++
++import whole_body_tracking.tasks.tracking.mdp as mdp
++from whole_body_tracking.tasks.tracking.config.g1.flat_env_cfg import G1FlatWoStateEstimationEnvCfg
++
++
++_quat_inv_apply = getattr(math_utils, "quat_apply_inverse", None) or math_utils.quat_rotate_inverse
++
++
++def bad_joint_pos(env, command_name: str, asset_cfg: SceneEntityCfg, threshold: float) -> torch.Tensor:
++    """지정 관절의 각도가 기준 동작에서 threshold[rad] 이상 벗어나면 True."""
++    command = env.command_manager.get_term(command_name)
++    asset = env.scene[asset_cfg.name]
++    ids = asset_cfg.joint_ids
++    err = torch.abs(command.joint_pos[:, ids] - asset.data.joint_pos[:, ids])
++    return torch.any(err > threshold, dim=-1)
++
++
++def bad_anchor_gravity(env, asset_cfg: SceneEntityCfg, command_name: str, threshold: float) -> torch.Tensor:
++    """몸통 좌표계에서 본 중력 방향 벡터 전체를 비교 (기존 anchor_ori는 z 성분만 비교)."""
++    asset = env.scene[asset_cfg.name]
++    command = env.command_manager.get_term(command_name)
++    g_ref = _quat_inv_apply(command.anchor_quat_w, asset.data.GRAVITY_VEC_W)
++    g_rob = _quat_inv_apply(command.robot_anchor_quat_w, asset.data.GRAVITY_VEC_W)
++    return torch.norm(g_ref - g_rob, dim=-1) > threshold
++
++
++LEG_BODIES = ["left_knee_link", "right_knee_link", "left_ankle_roll_link", "right_ankle_roll_link"]
++
++
++@configclass
++class G1GetupEnvCfg(G1FlatWoStateEstimationEnvCfg):
++    def __post_init__(self):
++        super().__post_init__()
++        self.terminations.anchor_ori = DoneTerm(
++            func=bad_anchor_gravity,
++            params={"asset_cfg": SceneEntityCfg("robot"), "command_name": "motion", "threshold": 0.5},
++        )
++        self.terminations.leg_body_pos = DoneTerm(
++            func=mdp.bad_motion_body_pos,
++            params={"command_name": "motion", "threshold": 0.3, "body_names": LEG_BODIES},
++        )
++        self.terminations.hip_joint_pos = DoneTerm(
++            func=bad_joint_pos,
++            params={
++                "command_name": "motion",
++                "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"]),
++                "threshold": 0.8,
++            },
++        )
++        self.commands.motion.adaptive_kernel_size = 3
++        self.rewards.undesired_contacts = None
++
++
++@configclass
++class G1GetupRobustEnvCfg(G1GetupEnvCfg):
++    """G1GetupEnvCfg + 질량(0.95~1.15배: unitree_mujoco 모델·실기가 학습 URDF보다 무거움)·PD gain 무작위화 (다른 시뮬레이터·실기 차이에 버티도록)."""
++
++    def __post_init__(self):
++        super().__post_init__()
++        self.events.robot_mass = EventTerm(
++            func=isaac_mdp.randomize_rigid_body_mass,
++            mode="startup",
++            params={"asset_cfg": SceneEntityCfg("robot", body_names=".*"),
++                    "mass_distribution_params": (0.95, 1.15), "operation": "scale"},
++        )
++        # unitree_mujoco 모델은 몸통이 1.77 kg 더 무거움(9.89 vs 8.12 kg) → 몸통에 0~2.5 kg 추가
++        self.events.torso_mass = EventTerm(
++            func=isaac_mdp.randomize_rigid_body_mass,
++            mode="startup",
++            params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
++                    "mass_distribution_params": (0.0, 2.5), "operation": "add"},
++        )
++        self.events.actuator_gains = EventTerm(
++            func=isaac_mdp.randomize_actuator_gains,
++            mode="reset",
++            params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
++                    "stiffness_distribution_params": (0.85, 1.15),
++                    "damping_distribution_params": (0.85, 1.15), "operation": "scale"},
++        )
++
++
++@configclass
++class G1GetupRobustFakeHandEnvCfg(G1GetupRobustEnvCfg):
++    """Robust + 실제 로봇의 가짜 손 (fake_hand.py가 만든 main_fakehand.urdf 사용)."""
++
++    def __post_init__(self):
++        super().__post_init__()
++        orig = self.scene.robot.spawn.asset_path
++        path = os.path.join(os.path.dirname(orig), "main_fakehand.urdf")
++        if not os.path.exists(path):
++            raise FileNotFoundError(f"{path} 없음 — fake_hand.py를 먼저 실행하세요")
++        self.scene.robot.spawn.asset_path = path
+diff --git a/source/whole_body_tracking/whole_body_tracking/utils/exporter.py b/source/whole_body_tracking/whole_body_tracking/utils/exporter.py
+index e096f90..b581b48 100644
+--- a/source/whole_body_tracking/whole_body_tracking/utils/exporter.py
++++ b/source/whole_body_tracking/whole_body_tracking/utils/exporter.py
+@@ -9,7 +9,6 @@ import torch
+ import onnx
+ 
+ from isaaclab.envs import ManagerBasedRLEnv
+-from isaaclab_rl.rsl_rl.exporter import _OnnxPolicyExporter
+ 
+ from whole_body_tracking.tasks.tracking.mdp import MotionCommand
+ 
+@@ -22,15 +21,23 @@ def export_motion_policy_as_onnx(
+     filename="policy.onnx",
+     verbose=False,
+ ):
++    """Export the actor plus the reference motion into one ONNX file.
++
++    ``actor_critic`` is the rsl-rl >= 4 actor model (``runner.alg.get_policy()``), which already contains its own
++    observation normalizer, so ``normalizer`` is ignored and kept only for call compatibility.
++    """
+     if not os.path.exists(path):
+         os.makedirs(path, exist_ok=True)
+-    policy_exporter = _OnnxMotionPolicyExporter(env, actor_critic, normalizer, verbose)
++    policy_exporter = _OnnxMotionPolicyExporter(env, actor_critic, verbose)
+     policy_exporter.export(path, filename)
+ 
+ 
+-class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
+-    def __init__(self, env: ManagerBasedRLEnv, actor_critic, normalizer=None, verbose=False):
+-        super().__init__(actor_critic, normalizer, verbose)
++class _OnnxMotionPolicyExporter(torch.nn.Module):
++    def __init__(self, env: ManagerBasedRLEnv, policy, verbose=False):
++        super().__init__()
++        self.verbose = verbose
++        self.policy = policy.as_onnx(verbose)  # rsl-rl >= 4: normalizer + mlp + deterministic output
++        self.input_size = self.policy.input_size
+         cmd: MotionCommand = env.command_manager.get_term("motion")
+ 
+         self.joint_pos = cmd.motion.joint_pos.to("cpu")
+@@ -44,7 +51,7 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
+     def forward(self, x, time_step):
+         time_step_clamped = torch.clamp(time_step.long().squeeze(-1), max=self.time_step_total - 1)
+         return (
+-            self.actor(self.normalizer(x)),
++            self.policy(x),
+             self.joint_pos[time_step_clamped],
+             self.joint_vel[time_step_clamped],
+             self.body_pos_w[time_step_clamped],
+@@ -55,12 +62,10 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
+ 
+     def export(self, path, filename):
+         self.to("cpu")
+-        obs = torch.zeros(1, self.actor[0].in_features)
++        self.eval()
++        obs = torch.zeros(1, self.input_size)
+         time_step = torch.zeros(1, 1)
+-        torch.onnx.export(
+-            self,
+-            (obs, time_step),
+-            os.path.join(path, filename),
++        kwargs = dict(
+             export_params=True,
+             opset_version=11,
+             verbose=self.verbose,
+@@ -76,6 +81,11 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
+             ],
+             dynamic_axes={},
+         )
++        with torch.no_grad():
++            try:
++                torch.onnx.export(self, (obs, time_step), os.path.join(path, filename), dynamo=False, **kwargs)
++            except TypeError:  # older torch without the `dynamo` argument
++                torch.onnx.export(self, (obs, time_step), os.path.join(path, filename), **kwargs)
+ 
+ 
+ def list_to_csv_str(arr, *, decimals: int = 3, delimiter: str = ",") -> str:
+@@ -102,8 +112,8 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
+     metadata = {
+         "run_path": run_path,
+         "joint_names": env.scene["robot"].data.joint_names,
+-        "joint_stiffness": env.scene["robot"].data.joint_stiffness[0].cpu().tolist(),
+-        "joint_damping": env.scene["robot"].data.joint_damping[0].cpu().tolist(),
++        "joint_stiffness": env.scene["robot"].data.default_joint_stiffness[0].cpu().tolist(),
++        "joint_damping": env.scene["robot"].data.default_joint_damping[0].cpu().tolist(),
+         "default_joint_pos": env.scene["robot"].data.default_joint_pos_nominal.cpu().tolist(),
+         "command_names": env.command_manager.active_terms,
+         "observation_names": observation_names,
+diff --git a/source/whole_body_tracking/whole_body_tracking/utils/my_on_policy_runner.py b/source/whole_body_tracking/whole_body_tracking/utils/my_on_policy_runner.py
+index 9b49b29..fff6f2a 100644
+--- a/source/whole_body_tracking/whole_body_tracking/utils/my_on_policy_runner.py
++++ b/source/whole_body_tracking/whole_body_tracking/utils/my_on_policy_runner.py
+@@ -3,20 +3,24 @@ import os
+ from rsl_rl.env import VecEnv
+ from rsl_rl.runners.on_policy_runner import OnPolicyRunner
+ 
+-from isaaclab_rl.rsl_rl import export_policy_as_onnx
+-
+ import wandb
+ from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+ 
+ 
++def _logger_type(runner: OnPolicyRunner):
++    """rsl-rl >= 4 keeps the logger type on runner.logger; older versions on the runner itself."""
++    logger = getattr(runner, "logger", None)
++    return getattr(logger, "logger_type", None) or getattr(runner, "logger_type", None)
++
++
+ class MyOnPolicyRunner(OnPolicyRunner):
+     def save(self, path: str, infos=None):
+         """Save the model and training information."""
+         super().save(path, infos)
+-        if self.logger_type in ["wandb"]:
++        if _logger_type(self) == "wandb":
+             policy_path = path.split("model")[0]
+             filename = policy_path.split("/")[-2] + ".onnx"
+-            export_policy_as_onnx(self.alg.policy, normalizer=self.obs_normalizer, path=policy_path, filename=filename)
++            self.export_policy_to_onnx(path=policy_path, filename=filename)
+             attach_onnx_metadata(self.env.unwrapped, wandb.run.name, path=policy_path, filename=filename)
+             wandb.save(policy_path + filename, base_path=os.path.dirname(policy_path))
+ 
+@@ -31,12 +35,10 @@ class MotionOnPolicyRunner(OnPolicyRunner):
+     def save(self, path: str, infos=None):
+         """Save the model and training information."""
+         super().save(path, infos)
+-        if self.logger_type in ["wandb"]:
++        if _logger_type(self) == "wandb":
+             policy_path = path.split("model")[0]
+             filename = policy_path.split("/")[-2] + ".onnx"
+-            export_motion_policy_as_onnx(
+-                self.env.unwrapped, self.alg.policy, normalizer=self.obs_normalizer, path=policy_path, filename=filename
+-            )
++            export_motion_policy_as_onnx(self.env.unwrapped, self.alg.get_policy(), path=policy_path, filename=filename)
+             attach_onnx_metadata(self.env.unwrapped, wandb.run.name, path=policy_path, filename=filename)
+             wandb.save(policy_path + filename, base_path=os.path.dirname(policy_path))
+ 
